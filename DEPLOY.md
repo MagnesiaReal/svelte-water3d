@@ -93,6 +93,39 @@ sudo systemctl reload caddy
 # or: sudo caddy reload --config /etc/caddy/Caddyfile
 ```
 
+## 3b. Static serving under a subpath (current setup: `/water/`)
+
+The app is mounted in the main Caddyfile with `handle_path /water/*`, serving
+`/var/www/svelte-water3d`. **No systemd service needed** for this — file_server
+reads `dist/` directly.
+
+```caddy
+handle_path /water/* {
+  root * /var/www/svelte-water3d
+  file_server
+}
+```
+
+**Critical — `base` must match the mount path.** With `handle_path`, the
+`/water` prefix is stripped from internal requests, but the browser still
+requests `/water/assets/...`. The build therefore needs:
+
+```js
+// vite.config.js
+export default defineConfig({
+  base: '/water/',
+  plugins: [svelte()]
+});
+```
+
+Without it, `index.html` references `/assets/...` (absolute), which escapes the
+`/water/*` handler, falls into the catch-all `handle` block → JS 404s → black page.
+
+Gotchas:
+- Use the trailing slash: `https://magneciareal.ddns.net/water/` — bare `/water` does not match `/water/*`.
+- Deploy the **whole** dist folder (`index.html` + `assets/`), and keep it readable: `chmod -R o+rX /var/www/svelte-water3d`.
+- Redeploy = `npm run build` locally (or on server) + copy `dist/*`; no restart needed.
+
 ## 4. Redeploy workflow
 
 ```bash
