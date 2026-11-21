@@ -42,7 +42,6 @@
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x04030a);
-    scene.fog = new THREE.Fog(0x04030a, 45, 160);
 
     const camera = new THREE.PerspectiveCamera(
       55,
@@ -59,12 +58,13 @@
     controls.autoRotateSpeed = 0.5;
     controls.maxPolarAngle = Math.PI * 0.46;
     controls.minDistance = 8;
-    controls.maxDistance = 120;
+    // zoom clamp: the camera stays well inside the mesh (half-width 130)
+    controls.maxDistance = 50;
     controls.target.set(0, 0, 0);
 
     // --- polygonal water mesh ---
-    const SIZE = 130;
-    const SEGMENTS = 90;
+    const SIZE = 260;
+    const SEGMENTS = 120;
     const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEGMENTS, SEGMENTS);
     geo.rotateX(-Math.PI / 2); // lay it flat: local y becomes world height
 
@@ -114,15 +114,140 @@
     );
     composer.addPass(bloom);
 
+    // --- mouse interaction: floating body + splash ripples ---
+    let time = 0;
+    let splashPulse = 0;
+
+    // expanding ripples: { x, z, t0, amp, k, omega, decay, radius }
+    const ripples = [];
+    const pointer = { x: 0, z: 0, has: false };
+    const follow = { x: 0, z: 0, strength: 0 }; // smoothed "floating object"
+
+    const raycaster = new THREE.Raycaster();
+    const ndc = new THREE.Vector2();
+    const waterPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+    const hit = new THREE.Vector3();
+
+    // project the mouse onto the flat water surface (y = 0)
+    function pointerWorld(clientX, clientY) {
+      ndc.set(
+        (clientX / window.innerWidth) * 2 - 1,
+        -(clientY / window.innerHeight) * 2 + 1
+      );
+      raycaster.setFromCamera(ndc, camera);
+      return raycaster.ray.intersectPlane(waterPlane, hit) ? hit : null;
+    }
+
+    function spawnRipple(x, z, amp, opts = {}) {
+      ripples.push({
+        x,
+        z,
+        t0: time,
+        amp,
+        k: opts.k ?? 0.55, // spatial frequency
+        omega: opts.omega ?? 2.4, // temporal frequency
+        decay: opts.decay ?? 1.1,
+        radius: opts.radius ?? 16
+      });
+      if (ripples.length > 28) ripples.shift();
+    }
+
+    let downX = 0, downY = 0, downT = 0;
+
+    function onPointerMove(e) {
+      const p = pointerWorld(e.clientX, e.clientY);
+      if (!p) {
+        pointer.has = false;
+        return;
+      }
+      const step = Math.hypot(p.x - pointer.x, p.z - pointer.z);
+      pointer.x = p.x;
+      pointer.z = p.z;
+      pointer.has = true;
+      // wake trail: small ripples while the "body" moves over the water
+      if (step > 1.2) {
+        spawnRipple(pointer.x, pointer.z, THREE.MathUtils.clamp(step * 0.06, 0.08, 0.5), {
+          k: 0.8,
+          omega: 3.2,
+          decay: 1.8,
+          radius: 10
+        });
+      }
+    }
+
+    function onPointerDown(e) {
+      downX = e.clientX;
+      downY = e.clientY;
+      downT = performance.now();
+    }
+
+    function onPointerUp(e) {
+      // treat as a click (ball thrown in) only if the drag was negligible
+      const moved = Math.hypot(e.clientX - downX, e.clientY - downY);
+      if (moved < 6 && performance.now() - downT < 450) {
+        const p = pointerWorld(e.clientX, e.clientY);
+        if (p) {
+          spawnRipple(p.x, p.z, 1.6, { k: 0.5, omega: 2.6, decay: 0.8, radius: 26 });
+          splashPulse = 1;
+        }
+      }
+    }
+
+    function onPointerLeave() {
+      pointer.has = false;
+    }
+
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointerleave', onPointerLeave);
+
+    // neon ring marker = the floating body (heavier/larger)
+    const markerGeo = new THREE.RingGeometry(2.4, 3.8, 48);
+    markerGeo.rotateX(-Math.PI / 2);
+    const markerMat = new THREE.MeshBasicMaterial({
+      color: NEON,
+      transparent: true,
+      opacity: 0,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    const marker = new THREE.Mesh(markerGeo, markerMat);
+    marker.visible = false;
+    scene.add(marker);
+
     // --- animate the mesh ---
     const tmp = new THREE.Color();
     function updateWater(t) {
       const arr = pos.array;
       const col = colors;
+      const rpLen = ripples.length;
       for (let i = 0; i < pos.count; i++) {
         const x = arr[i * 3];
         const z = arr[i * 3 + 2];
-        const h = waveHeight(x, z, t) * params.amplitude;
+
+        // base waves + mouse disturbances
+        let extra = 0;
+        for (let r = 0; r < rpLen; r++) {
+          const rp = ripples[r];
+          const age = t - rp.t0;
+          const d = Math.hypot(x - rp.x, z - rp.z);
+          if (d > rp.radius) continue;
+          const envelope = Math.exp(-age * rp.decay) * Math.exp(-d * 0.12);
+          extra += rp.amp * Math.sin(d * rp.k - age * rp.omega) * envelope;
+        }
+        if (follow.strength > 0.02) {
+          const d = Math.hypot(x - follow.x, z - follow.z);
+          // heavy dent under the floating body + wide bulged rim around it
+          extra +=
+            -2.2 * follow.strength * Math.exp(-d * d / 14) +
+            1.0 * follow.strength * Math.exp(-(d - 3.2) * (d - 3.2) / 4);
+          // persistent concentric ripples radiating from the body while hovering
+          extra += 0.6 * follow.strength * Math.sin(d * 0.6 - t * 3.4) * Math.exp(-d * 0.15);
+        }
+
+        const h = (waveHeight(x, z, t) + extra) * params.amplitude;
         arr[i * 3 + 1] = h;
 
         // height -> neon gradient
@@ -141,7 +266,6 @@
     }
 
     const clock = new THREE.Clock();
-    let time = 0;
     let raf = 0;
     let frames = 0;
     let fpsTimer = 0;
@@ -150,9 +274,29 @@
       const dt = clock.getDelta();
       time += dt * params.speed;
 
+      // heavy body: slower inertia, it lags behind the pointer
+      const targetStrength = pointer.has ? 1 : 0;
+      follow.strength += (targetStrength - follow.strength) * Math.min(dt * 4.5, 1);
+      follow.x += (pointer.x - follow.x) * Math.min(dt * 5.5, 1);
+      follow.z += (pointer.z - follow.z) * Math.min(dt * 5.5, 1);
+
+      // prune expired ripples (stored oldest-first)
+      while (ripples.length && time - ripples[0].t0 > 6) ripples.shift();
+
       updateWater(time);
       wireMat.opacity = params.wireOpacity;
       fill.visible = !params.wireOnly;
+
+      // neon marker rides on the dent of the floating body
+      marker.visible = follow.strength > 0.02;
+      if (marker.visible) {
+        const mh = waveHeight(follow.x, follow.z, time) * params.amplitude;
+        marker.position.set(follow.x, mh + 0.25, follow.z);
+        marker.scale.setScalar(1 + 0.18 * Math.sin(time * 4) + splashPulse * 1.4);
+        markerMat.opacity =
+          follow.strength * (0.6 + 0.25 * Math.sin(time * 3)) + splashPulse * 0.5;
+      }
+      splashPulse *= Math.exp(-6 * dt);
 
       controls.update();
       composer.render();
@@ -179,10 +323,16 @@
     return () => {
       cancelAnimationFrame(raf);
       window.removeEventListener('resize', onResize);
+      canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('pointerdown', onPointerDown);
+      canvas.removeEventListener('pointerup', onPointerUp);
+      canvas.removeEventListener('pointerleave', onPointerLeave);
       controls.dispose();
       geo.dispose();
       fillMat.dispose();
       wireMat.dispose();
+      markerGeo.dispose();
+      markerMat.dispose();
       composer.dispose();
       renderer.dispose();
     };
@@ -219,7 +369,7 @@
 </div>
 
 <div class="telemetry">
-  FPS {fps} · drag to orbit · scroll to zoom
+  FPS {fps} · drag to orbit · scroll to zoom · hover = floating body · click = splash
 </div>
 
 <style>

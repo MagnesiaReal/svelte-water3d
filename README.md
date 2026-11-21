@@ -25,7 +25,7 @@ npm run preview
 
 ## How it works
 
-- `PlaneGeometry` (90×90 segments) triangulated into ~16k triangles.
+- `PlaneGeometry` (260 units, 120×120 segments) triangulated into ~28k triangles, with a zoom clamp so the camera stays inside the mesh.
 - Each frame, vertex heights are displaced by layered sine waves (procedural water).
 - Vertex colors map wave height → dark amber to bright neon orange.
 - A wireframe overlay in `#ff6a00` + `UnrealBloomPass` produces the neon glow.
