@@ -7,22 +7,19 @@
   import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 
   let canvas;
-  let fps = 0;
+  let fps = $state(0);
 
   // live-tunable simulation parameters
   let params = $state({
     speed: 1.0,
-    amplitude: 1.0,
+    amplitude: 1.0, // scales the sea only; object-made waves keep their own amplitude
+    orbWeight: 1.0, // orb mass: shapes its dent/wake and how hard the waves push it
     wireOpacity: 0.85,
     wireOnly: false
   });
 
   // neon palette
   const NEON = 0xff6a00;
-  const DEEP = new THREE.Color(0x120600);
-  const MID = new THREE.Color(0x5a1c00);
-  const BRIGHT = new THREE.Color(0xff8a2a);
-  const CREST = new THREE.Color(0xffd08a);
 
   // layered sine waves ≈ procedural water surface
   function waveHeight(x, z, t) {
@@ -36,8 +33,9 @@
   }
 
   onMount(() => {
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: false });
+    // cap pixel ratio: bloom hides aliasing, full DPR is wasted fill-rate
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     renderer.setSize(window.innerWidth, window.innerHeight);
 
     const scene = new THREE.Scene();
@@ -62,37 +60,132 @@
     controls.maxDistance = 50;
     controls.target.set(0, 0, 0);
 
-    // --- polygonal water mesh ---
+    // --- polygonal water mesh: displacement + neon edges live on the GPU ---
     const SIZE = 260;
     const SEGMENTS = 120;
-    const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEGMENTS, SEGMENTS);
+    const MAX_RIPPLES = 20; // fixed GLSL array bound
+
+    // non-indexed: every triangle owns its own vertices -> static barycentric coords
+    const geo = new THREE.PlaneGeometry(SIZE, SIZE, SEGMENTS, SEGMENTS).toNonIndexed();
     geo.rotateX(-Math.PI / 2); // lay it flat: local y becomes world height
 
-    const pos = geo.attributes.position;
-    const colors = new Float32Array(pos.count * 3);
-    geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    const bary = new Float32Array(geo.attributes.position.count * 3);
+    for (let i = 0; i < bary.length; i += 9) {
+      bary[i] = 1; // vertex 0 -> (1,0,0)
+      bary[i + 4] = 1; // vertex 1 -> (0,1,0)
+      bary[i + 8] = 1; // vertex 2 -> (0,0,1)
+    }
+    geo.setAttribute('aBary', new THREE.BufferAttribute(bary, 3));
 
-    // faceted fill: flat-shaded triangles tinted by wave height
-    const fillMat = new THREE.MeshStandardMaterial({
-      vertexColors: true,
+    // uniforms shared with the patched shader; updated every tick
+    const U = {
+      uTime: { value: 0 },
+      uAmp: { value: params.amplitude },
+      uWireGlow: { value: params.wireOpacity },
+      uWireOnly: { value: 0 },
+      uFollow: { value: new THREE.Vector4(0, 0, 0, 0) }, // x, z, strength
+      uOrb: { value: new THREE.Vector3(0, 14, 1) }, // x, z, weight
+      uNeon: { value: new THREE.Color(NEON) },
+      uRipCount: { value: 0 },
+      uRipA: { value: Array.from({ length: MAX_RIPPLES }, () => new THREE.Vector4()) }, // x, z, t0, amp
+      uRipB: { value: Array.from({ length: MAX_RIPPLES }, () => new THREE.Vector4()) } // k, omega, decay, radius
+    };
+
+    const waterMat = new THREE.MeshStandardMaterial({
       flatShading: true,
       roughness: 0.35,
       metalness: 0.55,
       emissive: 0xff4a00,
       emissiveIntensity: 0.2
     });
-    const fill = new THREE.Mesh(geo, fillMat);
 
-    // neon triangle wireframe
-    const wireMat = new THREE.MeshBasicMaterial({
-      color: NEON,
-      wireframe: true,
-      transparent: true,
-      opacity: params.wireOpacity
-    });
-    const wire = new THREE.Mesh(geo, wireMat);
+    waterMat.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, U);
 
-    scene.add(fill, wire);
+      shader.vertexShader =
+        'attribute vec3 aBary;\n' +
+        'uniform float uTime;\nuniform float uAmp;\n' +
+        'uniform vec4 uFollow;\nuniform vec3 uOrb;\n' +
+        'uniform int uRipCount;\nuniform vec4 uRipA[20];\nuniform vec4 uRipB[20];\n' +
+        'varying float vWaveH;\nvarying vec3 vBary;\n' +
+        shader.vertexShader;
+
+      // mirror of the JS waveHeight() + ripples + floating-body/orb fields
+      shader.vertexShader = shader.vertexShader.replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        float base =
+          sin(position.x * 0.18 + uTime * 1.25) * 0.9 +
+          sin(position.z * 0.21 - uTime * 0.95) * 0.75 +
+          sin((position.x + position.z) * 0.12 + uTime * 1.55) * 0.55 +
+          sin((position.x - position.z) * 0.27 - uTime * 0.7) * 0.4 +
+          sin(position.x * 0.42 + position.z * 0.31 + uTime * 2.1) * 0.3;
+        float extra = 0.0;
+        for (int i = 0; i < 20; i++) {
+          if (i >= uRipCount) break;
+          vec4 rp = uRipA[i];
+          vec4 q = uRipB[i];
+          float age = uTime - rp.z;
+          float d = distance(position.xz, rp.xy);
+          if (d > q.w) continue;
+          extra += rp.w * sin(d * q.x - age * q.y) * exp(-age * q.z) * exp(-d * 0.12);
+        }
+        if (uFollow.w > 0.02) {
+          float s = uFollow.w;
+          float d = distance(position.xz, uFollow.xy);
+          // heavy dent + bulged rim + persistent ripples from the hovering body
+          extra += -2.2 * s * exp(-d * d / 14.0) + 1.0 * s * exp(-(d - 3.2) * (d - 3.2) / 4.0);
+          extra += 0.6 * s * sin(d * 0.6 - uTime * 3.4) * exp(-d * 0.15);
+        }
+        // orb dent scales with its weight (uOrb.z), not with the sea slider
+        float m = uOrb.z;
+        float od = distance(position.xz, uOrb.xy);
+        extra += -0.22 * m * exp(-od * od / 7.0) + 0.12 * m * exp(-(od - 2.0) * (od - 2.0) / 2.5);
+        // AMPLITUDE scales the sea; object-made waves keep their own amplitude
+        float h = base * uAmp + extra * (0.4 + 0.6 * uAmp);
+        transformed.y += h;
+        vWaveH = h;
+        vBary = aBary;`
+      );
+
+      shader.fragmentShader =
+        'uniform float uWireGlow;\nuniform float uWireOnly;\nuniform vec3 uNeon;\n' +
+        'varying float vWaveH;\nvarying vec3 vBary;\n' +
+        shader.fragmentShader;
+
+      // height -> neon gradient (linear-space values)
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+        float n = clamp((vWaveH + 2.6) / 5.2, 0.0, 1.0);
+        vec3 deep = vec3(0.006, 0.002, 0.0);
+        vec3 bright = vec3(1.0, 0.102, 0.010);
+        vec3 crest = vec3(1.0, 0.631, 0.254);
+        diffuseColor.rgb = n > 0.8 ? mix(bright, crest, (n - 0.8) / 0.2) : mix(deep, bright, n);
+        if (uWireOnly > 0.5) diffuseColor.rgb = vec3(0.0);`
+      );
+
+      // barycentric wireframe: edges = where the smallest barycentric coord is ~0
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <emissivemap_fragment>',
+        `#include <emissivemap_fragment>
+        float edge = min(min(vBary.x, vBary.y), vBary.z);
+        float wire = 1.0 - smoothstep(0.0, fwidth(edge) * 1.5, edge);
+        if (uWireOnly > 0.5) totalEmissiveRadiance = uNeon * uWireGlow * wire;
+        else totalEmissiveRadiance += uNeon * uWireGlow * wire;`
+      );
+
+      // wireframe-only: kill facet lighting (diffuse + specular), keep only the neon edges
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <transmission_fragment>',
+        `#include <transmission_fragment>
+        if (uWireOnly > 0.5) { totalDiffuse = vec3(0.0); totalSpecular = vec3(0.0); }`
+      );
+    };
+
+    // one draw call: shaded facets + neon triangle edges together
+    const water = new THREE.Mesh(geo, waterMat);
+    scene.add(water);
 
     // lights
     scene.add(new THREE.AmbientLight(0x2a1408, 0.9));
@@ -106,13 +199,20 @@
     // --- bloom for the neon glow ---
     const composer = new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, camera));
+    // mip chain at half the usual resolution: bloom is diffuse, the detail is invisible
     const bloom = new UnrealBloomPass(
-      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      new THREE.Vector2(window.innerWidth >> 1, window.innerHeight >> 1),
       0.9, // strength
       0.45, // radius
       0.2 // threshold
     );
     composer.addPass(bloom);
+    // composer.setSize would reset the bloom to full-res mips; keep it halved
+    const baseSetSize = composer.setSize.bind(composer);
+    composer.setSize = (w, h) => {
+      baseSetSize(w, h);
+      bloom.setSize(w >> 1, h >> 1);
+    };
 
     // --- mouse interaction: floating body + splash ripples ---
     let time = 0;
@@ -149,7 +249,7 @@
         decay: opts.decay ?? 1.1,
         radius: opts.radius ?? 16
       });
-      if (ripples.length > 28) ripples.shift();
+      if (ripples.length > MAX_RIPPLES) ripples.shift();
     }
 
     let downX = 0, downY = 0, downT = 0;
@@ -272,8 +372,11 @@
 
       const targetVx = (fwd.x * w + right.x * s) * 22;
       const targetVz = (fwd.z * w + right.z * s) * 22;
-      orbState.vx += (targetVx - orbState.vx) * Math.min(dt * 4, 1);
-      orbState.vz += (targetVz - orbState.vz) * Math.min(dt * 4, 1);
+      // a heavier orb accelerates slower when steering too
+      const m = params.orbWeight;
+      const steer = Math.min(dt * 4 / m, 1);
+      orbState.vx += (targetVx - orbState.vx) * steer;
+      orbState.vz += (targetVz - orbState.vz) * steer;
 
       // --- water drag: waves push the orb like a current pushing an animal ---
       // wave slope at the orb position (finite differences of the wave field)
@@ -290,8 +393,8 @@
       const curX = Math.sin(orbState.z * 0.06 + time * 0.4) * 1.4;
       const curZ = Math.cos(orbState.x * 0.05 - time * 0.32) * 1.4;
 
-      orbState.vx += (slopeX + curX) * dt * 2.2;
-      orbState.vz += (slopeZ + curZ) * dt * 2.2;
+      orbState.vx += (slopeX + curX) * dt * 2.2 / m;
+      orbState.vz += (slopeZ + curZ) * dt * 2.2 / m;
       orbState.vx = THREE.MathUtils.clamp(orbState.vx, -30, 30);
       orbState.vz = THREE.MathUtils.clamp(orbState.vz, -30, 30);
 
@@ -299,68 +402,33 @@
       orbState.z = THREE.MathUtils.clamp(orbState.z + orbState.vz * dt, -120, 120);
       orbState.speed = Math.hypot(orbState.vx, orbState.vz);
 
-      // wake ripples while skimming over the water
+      // wake ripples: amplitude/wavelength come from the orb's own speed + weight,
+      // not from the AMPLITUDE slider
       if (orbState.speed > 3) {
-        spawnRipple(orbState.x, orbState.z, THREE.MathUtils.clamp(orbState.speed * 0.03, 0.06, 0.3), {
-          k: 0.8,
-          omega: 3.2,
-          decay: 1.6,
-          radius: 9
+        spawnRipple(orbState.x, orbState.z, THREE.MathUtils.clamp(orbState.speed * orbState.speed * 0.004 * m, 0.04, 0.5), {
+          k: 0.8 / m, // heavier body -> longer wavelength
+          omega: 3.2 / m, // heavier body -> slower ripple
+          decay: 1.5,
+          radius: 8 + 5 * m
         });
       }
     }
 
-    // --- animate the mesh ---
-    const tmp = new THREE.Color();
-    function updateWater(t) {
-      const arr = pos.array;
-      const col = colors;
-      const rpLen = ripples.length;
-      for (let i = 0; i < pos.count; i++) {
-        const x = arr[i * 3];
-        const z = arr[i * 3 + 2];
-
-        // base waves + mouse disturbances
-        let extra = 0;
-        for (let r = 0; r < rpLen; r++) {
-          const rp = ripples[r];
-          const age = t - rp.t0;
-          const d = Math.hypot(x - rp.x, z - rp.z);
-          if (d > rp.radius) continue;
-          const envelope = Math.exp(-age * rp.decay) * Math.exp(-d * 0.12);
-          extra += rp.amp * Math.sin(d * rp.k - age * rp.omega) * envelope;
-        }
-        if (follow.strength > 0.02) {
-          const d = Math.hypot(x - follow.x, z - follow.z);
-          // heavy dent under the floating body + wide bulged rim around it
-          extra +=
-            -2.2 * follow.strength * Math.exp(-d * d / 14) +
-            1.0 * follow.strength * Math.exp(-(d - 3.2) * (d - 3.2) / 4);
-          // persistent concentric ripples radiating from the body while hovering
-          extra += 0.6 * follow.strength * Math.sin(d * 0.6 - t * 3.4) * Math.exp(-d * 0.15);
-        }
-        // dent under the living sphere riding the surface
-        const od = Math.hypot(x - orbState.x, z - orbState.z);
-        extra +=
-          -0.55 * Math.exp(-od * od / 7) +
-          0.25 * Math.exp(-(od - 2) * (od - 2) / 2.5);
-
-        const h = (waveHeight(x, z, t) + extra) * params.amplitude;
-        arr[i * 3 + 1] = h;
-
-        // height -> neon gradient
-        const n = THREE.MathUtils.clamp((h + 2.6) / 5.2, 0, 1);
-        if (n > 0.8) {
-          tmp.copy(BRIGHT).lerp(CREST, (n - 0.8) / 0.2);
-        } else {
-          tmp.copy(DEEP).lerp(BRIGHT, n);
-        }
-        col[i * 3] = tmp.r;
-        col[i * 3 + 1] = tmp.g;
-        col[i * 3 + 2] = tmp.b;
+    // --- push the simulation state to the GPU each tick (no per-vertex CPU loop) ---
+    function uploadWater(t) {
+      U.uTime.value = t;
+      U.uAmp.value = params.amplitude;
+      U.uWireGlow.value = params.wireOpacity;
+      U.uWireOnly.value = params.wireOnly ? 1 : 0;
+      U.uFollow.value.set(follow.x, follow.z, follow.strength, 0);
+      U.uOrb.value.set(orbState.x, orbState.z, params.orbWeight);
+      const n = Math.min(ripples.length, MAX_RIPPLES);
+      U.uRipCount.value = n;
+      for (let i = 0; i < n; i++) {
+        const rp = ripples[i];
+        U.uRipA.value[i].set(rp.x, rp.z, rp.t0, rp.amp);
+        U.uRipB.value[i].set(rp.k, rp.omega, rp.decay, rp.radius);
       }
-      pos.needsUpdate = true;
-      geo.attributes.color.needsUpdate = true;
     }
 
     const clock = new THREE.Clock();
@@ -381,9 +449,7 @@
       // prune expired ripples (stored oldest-first)
       while (ripples.length && time - ripples[0].t0 > 6) ripples.shift();
 
-      updateWater(time);
-      wireMat.opacity = params.wireOpacity;
-      fill.visible = !params.wireOnly;
+      uploadWater(time);
 
       // neon marker rides on the dent of the floating body
       marker.visible = follow.strength > 0.02;
@@ -398,11 +464,15 @@
 
       // living orb: rides the waves, pulses with a "breathing" glow
       moveOrb(dt);
+      const m = params.orbWeight;
       const oh = waveHeight(orbState.x, orbState.z, time) * params.amplitude;
-      orb.position.set(orbState.x, oh + 1.3 + Math.sin(time * 2.3) * 0.25, orbState.z);
-      orb.scale.setScalar(1 + 0.07 * Math.sin(time * 2.6));
+      // buoyancy: a heavier orb sits lower in its own dent and bobs less
+      orb.position.set(orbState.x, oh + 1.35 - 0.3 * m + Math.sin(time * 2.3) * (0.25 / m), orbState.z);
+      // heavier orb is physically bigger; the breathing pulse is subtler at mass
+      orb.scale.setScalar(0.8 + 0.2 * m + (0.07 / m) * Math.sin(time * 2.6));
       orbMat.emissiveIntensity = 1.5 + 0.6 * Math.sin(time * 1.8);
-      halo.position.set(orbState.x, oh + 0.85, orbState.z);
+      halo.position.set(orbState.x, oh + 0.85 - 0.25 * m, orbState.z);
+      halo.scale.setScalar(0.8 + 0.2 * m);
       halo.rotation.x = 0.14 * Math.sin(time * 1.5); // gentle tilt sway
       haloMat.opacity = 0.4 + 0.25 * Math.sin(time * 3) + orbState.speed * 0.02;
 
@@ -439,8 +509,7 @@
       window.removeEventListener('keyup', onKeyUp);
       controls.dispose();
       geo.dispose();
-      fillMat.dispose();
-      wireMat.dispose();
+      waterMat.dispose();
       markerGeo.dispose();
       markerMat.dispose();
       orbGeo.dispose();
@@ -472,6 +541,11 @@
     <span>{params.amplitude.toFixed(2)}</span>
   </label>
   <label>
+    ORB WEIGHT
+    <input type="range" bind:value={params.orbWeight} min="0.4" max="2.5" step="0.1" />
+    <span>{params.orbWeight.toFixed(1)}</span>
+  </label>
+  <label>
     WIRE GLOW
     <input type="range" bind:value={params.wireOpacity} min="0.05" max="1" step="0.05" />
     <span>{params.wireOpacity.toFixed(2)}</span>
@@ -483,7 +557,7 @@
 </div>
 
 <div class="telemetry">
-  FPS {fps} · drag to orbit · scroll to zoom · hover = floating body · click = splash · WASD = orb (waves drag it)
+  FPS {fps} · drag to orbit · scroll to zoom · hover = floating body · click = splash · WASD = orb (waves drag it · weight shapes its wake)
 </div>
 
 <style>
