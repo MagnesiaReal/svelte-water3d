@@ -217,6 +217,99 @@
     marker.visible = false;
     scene.add(marker);
 
+    // --- living neon-blue sphere, WASD-driven, floating over the water ---
+    const orbState = { x: 0, z: 14, vx: 0, vz: 0, speed: 0 };
+    const orbGeo = new THREE.SphereGeometry(1.6, 32, 24);
+    const orbMat = new THREE.MeshStandardMaterial({
+      color: 0x00304a,
+      emissive: 0x00c8ff,
+      emissiveIntensity: 1.6,
+      roughness: 0.3,
+      metalness: 0.7
+    });
+    const orb = new THREE.Mesh(orbGeo, orbMat);
+    scene.add(orb);
+    // neon halo ring around the orb
+    const haloGeo = new THREE.RingGeometry(2.2, 2.9, 48);
+    haloGeo.rotateX(-Math.PI / 2);
+    const haloMat = new THREE.MeshBasicMaterial({
+      color: 0x00d8ff,
+      transparent: true,
+      opacity: 0.5,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false
+    });
+    const halo = new THREE.Mesh(haloGeo, haloMat);
+    scene.add(halo);
+
+    const keys = new Set();
+    function onKeyDown(e) {
+      keys.add(e.key.toLowerCase());
+      if (e.key.startsWith('Arrow')) e.preventDefault();
+    }
+    function onKeyUp(e) {
+      keys.delete(e.key.toLowerCase());
+    }
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+
+    const camDir = new THREE.Vector3();
+    const fwd = new THREE.Vector3();
+    const right = new THREE.Vector3();
+
+    function moveOrb(dt) {
+      let w = 0, s = 0;
+      if (keys.has('w') || keys.has('arrowup')) w += 1;
+      if (keys.has('s') || keys.has('arrowdown')) w -= 1;
+      if (keys.has('a') || keys.has('arrowleft')) s -= 1;
+      if (keys.has('d') || keys.has('arrowright')) s += 1;
+
+      // camera-relative directions projected onto the water plane
+      camera.getWorldDirection(camDir);
+      fwd.set(camDir.x, 0, camDir.z).normalize();
+      right.set(-fwd.z, 0, fwd.x);
+
+      const targetVx = (fwd.x * w + right.x * s) * 22;
+      const targetVz = (fwd.z * w + right.z * s) * 22;
+      orbState.vx += (targetVx - orbState.vx) * Math.min(dt * 4, 1);
+      orbState.vz += (targetVz - orbState.vz) * Math.min(dt * 4, 1);
+
+      // --- water drag: waves push the orb like a current pushing an animal ---
+      // wave slope at the orb position (finite differences of the wave field)
+      const eps = 1.5;
+      const amp = params.amplitude;
+      const dhx = (waveHeight(orbState.x + eps, orbState.z, time) -
+        waveHeight(orbState.x - eps, orbState.z, time)) * amp / (2 * eps);
+      const dhz = (waveHeight(orbState.x, orbState.z + eps, time) -
+        waveHeight(orbState.x, orbState.z - eps, time)) * amp / (2 * eps);
+      // slides down the wave face: crests ahead slow it, downhill speeds it
+      const slopeX = -dhx * 30;
+      const slopeZ = -dhz * 30;
+      // slow wandering ocean current, so the orb drifts even with no keys
+      const curX = Math.sin(orbState.z * 0.06 + time * 0.4) * 1.4;
+      const curZ = Math.cos(orbState.x * 0.05 - time * 0.32) * 1.4;
+
+      orbState.vx += (slopeX + curX) * dt * 2.2;
+      orbState.vz += (slopeZ + curZ) * dt * 2.2;
+      orbState.vx = THREE.MathUtils.clamp(orbState.vx, -30, 30);
+      orbState.vz = THREE.MathUtils.clamp(orbState.vz, -30, 30);
+
+      orbState.x = THREE.MathUtils.clamp(orbState.x + orbState.vx * dt, -120, 120);
+      orbState.z = THREE.MathUtils.clamp(orbState.z + orbState.vz * dt, -120, 120);
+      orbState.speed = Math.hypot(orbState.vx, orbState.vz);
+
+      // wake ripples while skimming over the water
+      if (orbState.speed > 3) {
+        spawnRipple(orbState.x, orbState.z, THREE.MathUtils.clamp(orbState.speed * 0.03, 0.06, 0.3), {
+          k: 0.8,
+          omega: 3.2,
+          decay: 1.6,
+          radius: 9
+        });
+      }
+    }
+
     // --- animate the mesh ---
     const tmp = new THREE.Color();
     function updateWater(t) {
@@ -246,6 +339,11 @@
           // persistent concentric ripples radiating from the body while hovering
           extra += 0.6 * follow.strength * Math.sin(d * 0.6 - t * 3.4) * Math.exp(-d * 0.15);
         }
+        // dent under the living sphere riding the surface
+        const od = Math.hypot(x - orbState.x, z - orbState.z);
+        extra +=
+          -0.55 * Math.exp(-od * od / 7) +
+          0.25 * Math.exp(-(od - 2) * (od - 2) / 2.5);
 
         const h = (waveHeight(x, z, t) + extra) * params.amplitude;
         arr[i * 3 + 1] = h;
@@ -298,6 +396,16 @@
       }
       splashPulse *= Math.exp(-6 * dt);
 
+      // living orb: rides the waves, pulses with a "breathing" glow
+      moveOrb(dt);
+      const oh = waveHeight(orbState.x, orbState.z, time) * params.amplitude;
+      orb.position.set(orbState.x, oh + 1.3 + Math.sin(time * 2.3) * 0.25, orbState.z);
+      orb.scale.setScalar(1 + 0.07 * Math.sin(time * 2.6));
+      orbMat.emissiveIntensity = 1.5 + 0.6 * Math.sin(time * 1.8);
+      halo.position.set(orbState.x, oh + 0.85, orbState.z);
+      halo.rotation.x = 0.14 * Math.sin(time * 1.5); // gentle tilt sway
+      haloMat.opacity = 0.4 + 0.25 * Math.sin(time * 3) + orbState.speed * 0.02;
+
       controls.update();
       composer.render();
 
@@ -327,12 +435,18 @@
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointerleave', onPointerLeave);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
       controls.dispose();
       geo.dispose();
       fillMat.dispose();
       wireMat.dispose();
       markerGeo.dispose();
       markerMat.dispose();
+      orbGeo.dispose();
+      orbMat.dispose();
+      haloGeo.dispose();
+      haloMat.dispose();
       composer.dispose();
       renderer.dispose();
     };
@@ -369,7 +483,7 @@
 </div>
 
 <div class="telemetry">
-  FPS {fps} · drag to orbit · scroll to zoom · hover = floating body · click = splash
+  FPS {fps} · drag to orbit · scroll to zoom · hover = floating body · click = splash · WASD = orb (waves drag it)
 </div>
 
 <style>
